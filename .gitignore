@@ -1,0 +1,10 @@
+/target
+/dist
+/playlists
+/priority-playlists
+/.iptvscraper-last-run.json
+/iptvscraper
+/iptvscraper-linux-x64
+/root@*
+*.log
+.DS_Store
