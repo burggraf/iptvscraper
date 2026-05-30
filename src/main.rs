@@ -297,10 +297,7 @@ async fn process_playlist(client: &Client, item: &PlaylistInput) -> PlaylistResu
     let movies_supported = fetch_count(client, &base, &item.username, &item.password, "get_vod_streams", "vod_streams", &mut errors).await;
     let series_supported = fetch_count(client, &base, &item.username, &item.password, "get_series", "series", &mut errors).await;
 
-    let priority_playlist = live_categories.iter().any(|c| {
-        let lc = c.to_lowercase();
-        c.contains("US") || lc.contains("locals")
-    });
+    let priority_playlist = is_priority_playlist(streams_allowed, expiration_date.as_deref(), &live_categories);
 
     PlaylistResult {
         scraped_at_local,
@@ -401,6 +398,29 @@ fn days_left_token(expiration_date: Option<&str>) -> i64 {
     (exp - now).num_days()
 }
 
+fn is_priority_playlist(streams_allowed: Option<u64>, expiration_date: Option<&str>, live_categories: &[String]) -> bool {
+    matches!(streams_allowed, Some(n) if n >= 2)
+        && expiration_is_priority(expiration_date)
+        && has_priority_category(live_categories)
+}
+
+fn expiration_is_priority(expiration_date: Option<&str>) -> bool {
+    match expiration_date {
+        None => true,
+        Some(s) if s.trim().is_empty() => true,
+        Some(s) => DateTime::parse_from_rfc3339(s)
+            .map(|exp| (exp.with_timezone(&Local) - Local::now()).num_days() >= 180)
+            .unwrap_or(false),
+    }
+}
+
+fn has_priority_category(live_categories: &[String]) -> bool {
+    live_categories.iter().any(|c| {
+        let lc = c.to_lowercase();
+        c.contains("US") || c.contains("Usa") || lc.contains("locals")
+    })
+}
+
 async fn notify_ntfy(client: &Client, topic_url: &str, processed: usize, priority_written: usize) {
     let body = format!("iptvscraper done: processed {processed} playlists; wrote {priority_written} priority playlists");
     let result = client
@@ -435,5 +455,20 @@ mod tests {
     fn parses_entry_date_from_url_slug() {
         let dt = parse_entry_date_from_url("https://www.iptvregion.eu.org/2026/05/iptv-28mai2026-table-of-28-account.html").unwrap();
         assert_eq!(dt.format("%Y-%m-%dT%H:%M:%S").to_string(), "2026-05-28T23:59:59");
+    }
+
+    #[test]
+    fn priority_playlist_needs_streams_expiration_and_us_or_locals_category() {
+        let us = vec!["US Entertainment".to_string()];
+        let usa = vec!["Usa Sports".to_string()];
+        let locals = vec!["LOCALs".to_string()];
+        let no_match = vec!["Canada".to_string()];
+
+        assert!(!is_priority_playlist(Some(1), None, &us));
+        assert!(is_priority_playlist(Some(2), None, &us));
+        assert!(is_priority_playlist(Some(2), Some(""), &us));
+        assert!(is_priority_playlist(Some(2), None, &usa));
+        assert!(is_priority_playlist(Some(2), None, &locals));
+        assert!(!is_priority_playlist(Some(2), None, &no_match));
     }
 }
