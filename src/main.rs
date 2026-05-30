@@ -2,10 +2,19 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDate, TimeZone};
 use clap::Parser;
 use regex::Regex;
-use reqwest::Client;
+use reqwest::{
+    Client,
+    header::{CONTENT_TYPE, RANGE},
+};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, fs, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
+    fs,
+    hash::{Hash, Hasher},
+    path::Path,
+    time::Duration,
+};
 use url::Url;
 
 const LABEL_URL: &str = "https://www.iptvregion.eu.org/search/label/XTREAM";
@@ -13,7 +22,10 @@ const STATE_FILE: &str = ".iptvscraper-last-run.json";
 const DEFAULT_NTFY_TOPIC_URL: &str = "https://ntfy.sh/mb-iptvscraper";
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Scrape IPTV Xtream playlists and report priority accounts")]
+#[command(
+    version,
+    about = "Scrape IPTV Xtream playlists and report priority accounts"
+)]
 struct Args {
     /// Process only this URL and exit.
     url: Option<String>,
@@ -65,7 +77,48 @@ struct PlaylistResult {
     movies_supported: Option<u64>,
     series_supported: Option<u64>,
     live_channel_categories: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality_test: Option<QualityTest>,
     errors: Vec<ErrorInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveCategory {
+    category_id: String,
+    category_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct LiveStream {
+    name: String,
+    stream_id: String,
+    category_id: String,
+    container_extension: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct QualityTest {
+    enabled: bool,
+    sample_size: usize,
+    candidates: usize,
+    tested: usize,
+    passed: usize,
+    failed: usize,
+    pass_rate: f64,
+    channels: Vec<QualityProbeResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct QualityProbeResult {
+    name: String,
+    stream_id: String,
+    category_name: String,
+    url: String,
+    ok: bool,
+    status: Option<u16>,
+    content_type: Option<String>,
+    bytes_read: usize,
+    reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,17 +174,28 @@ async fn main() -> Result<()> {
         println!("processed {processed}/{total}, remaining {remaining}");
         let result = process_playlist(&client, &item).await;
         let is_priority = result.priority_playlist;
-        let folder = if is_priority { "priority-playlists" } else { "playlists" };
+        let folder = if is_priority {
+            "priority-playlists"
+        } else {
+            "playlists"
+        };
         if is_priority {
             priority_written += 1;
         }
-        let file_name = make_file_name(&item.server, &item.username, result.streams_allowed, result.expiration_date.as_deref());
+        let file_name = make_file_name(
+            &item.server,
+            &item.username,
+            result.streams_allowed,
+            result.expiration_date.as_deref(),
+        );
         let path = Path::new(folder).join(file_name);
         fs::write(&path, serde_json::to_string_pretty(&result)?)?;
     }
 
     if total > 0 {
-        println!("summary: processed {processed} playlists; wrote {priority_written} priority playlists");
+        println!(
+            "summary: processed {processed} playlists; wrote {priority_written} priority playlists"
+        );
         if priority_written > 0 {
             notify_ntfy(&client, &args.ntfy_topic, processed, priority_written).await;
         }
@@ -150,7 +214,11 @@ fn compute_cutoff(args: &Args) -> Result<DateTime<Local>> {
     if let Ok(text) = fs::read_to_string(STATE_FILE) {
         if let Some(ts) = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
-            .and_then(|v| v.get("last_run_local").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .and_then(|v| {
+                v.get("last_run_local")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+            })
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
         {
             return Ok(ts.with_timezone(&Local));
@@ -175,10 +243,18 @@ async fn scrape_label_entries(client: &Client, url: &str) -> Result<Vec<Entry>> 
     let re = Regex::new(r"/\d{4}/\d{2}/.+\.html$").unwrap();
     for a in doc.select(&entry_sel) {
         let href = a.value().attr("href").unwrap_or("");
-        if !re.is_match(href) { continue; }
+        if !re.is_match(href) {
+            continue;
+        }
         let title = link_title(&a);
-        let published = title.as_deref().and_then(parse_entry_date).or_else(|| parse_entry_date_from_url(href));
-        entries.push(Entry { url: absolutize(url, href)?, published });
+        let published = title
+            .as_deref()
+            .and_then(parse_entry_date)
+            .or_else(|| parse_entry_date_from_url(href));
+        entries.push(Entry {
+            url: absolutize(url, href)?,
+            published,
+        });
     }
     entries.sort_by_key(|e| e.published);
     entries.dedup_by(|a, b| a.url == b.url);
@@ -193,7 +269,11 @@ fn link_title(a: &scraper::ElementRef<'_>) -> Option<String> {
 
     let img_sel = Selector::parse("img").ok()?;
     a.select(&img_sel)
-        .find_map(|img| img.value().attr("alt").or_else(|| img.value().attr("title")))
+        .find_map(|img| {
+            img.value()
+                .attr("alt")
+                .or_else(|| img.value().attr("title"))
+        })
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
@@ -245,10 +325,19 @@ async fn parse_url_as_inputs(client: &Client, url: &str) -> Result<Vec<PlaylistI
     let cell_sel = Selector::parse("td").unwrap();
     let mut out = Vec::new();
     for row in doc.select(&row_sel) {
-        let cells: Vec<String> = row.select(&cell_sel).map(|c| c.text().collect::<Vec<_>>().join(" ").trim().to_string()).collect();
-        if cells.len() < 3 { continue; }
-        if cells[0].to_lowercase().contains("server") { continue; }
-        if cells[0].is_empty() || cells[1].is_empty() || cells[2].is_empty() { continue; }
+        let cells: Vec<String> = row
+            .select(&cell_sel)
+            .map(|c| c.text().collect::<Vec<_>>().join(" ").trim().to_string())
+            .collect();
+        if cells.len() < 3 {
+            continue;
+        }
+        if cells[0].to_lowercase().contains("server") {
+            continue;
+        }
+        if cells[0].is_empty() || cells[1].is_empty() || cells[2].is_empty() {
+            continue;
+        }
         out.push(PlaylistInput {
             source_entry_title: page_title(&doc).unwrap_or_else(|| url.to_string()),
             source_entry_url: url.to_string(),
@@ -262,14 +351,21 @@ async fn parse_url_as_inputs(client: &Client, url: &str) -> Result<Vec<PlaylistI
 
 fn page_title(doc: &Html) -> Option<String> {
     let sel = Selector::parse("title").ok()?;
-    doc.select(&sel).next().map(|n| n.text().collect::<Vec<_>>().join(" ").trim().to_string()).filter(|s| !s.is_empty())
+    doc.select(&sel)
+        .next()
+        .map(|n| n.text().collect::<Vec<_>>().join(" ").trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 async fn process_playlist(client: &Client, item: &PlaylistInput) -> PlaylistResult {
     let mut errors = Vec::new();
     let scraped_at_local = Local::now().to_rfc3339();
     let base = normalize_server(&item.server);
-    let api = format!("{base}/player_api.php?username={}&password={}", urlencoding::encode(&item.username), urlencoding::encode(&item.password));
+    let api = format!(
+        "{base}/player_api.php?username={}&password={}",
+        urlencoding::encode(&item.username),
+        urlencoding::encode(&item.password)
+    );
 
     let mut streams_allowed = None;
     let mut streams_in_use = None;
@@ -292,12 +388,56 @@ async fn process_playlist(client: &Client, item: &PlaylistInput) -> PlaylistResu
         Err(e) => errors.push(err("player_api", "request_error", e.to_string())),
     }
 
-    let live_categories = fetch_category_names(client, &base, &item.username, &item.password, "get_live_categories", "live_categories", &mut errors).await;
-    let live_channels_supported = fetch_count(client, &base, &item.username, &item.password, "get_live_streams", "live_streams", &mut errors).await;
-    let movies_supported = fetch_count(client, &base, &item.username, &item.password, "get_vod_streams", "vod_streams", &mut errors).await;
-    let series_supported = fetch_count(client, &base, &item.username, &item.password, "get_series", "series", &mut errors).await;
+    let live_categories =
+        fetch_live_categories(client, &base, &item.username, &item.password, &mut errors).await;
+    let live_category_names = live_categories
+        .iter()
+        .map(|c| c.category_name.clone())
+        .collect::<Vec<_>>();
+    let live_streams =
+        fetch_live_streams(client, &base, &item.username, &item.password, &mut errors).await;
+    let live_channels_supported = live_streams.as_ref().map(|streams| streams.len() as u64);
+    let movies_supported = fetch_count(
+        client,
+        &base,
+        &item.username,
+        &item.password,
+        "get_vod_streams",
+        "vod_streams",
+        &mut errors,
+    )
+    .await;
+    let series_supported = fetch_count(
+        client,
+        &base,
+        &item.username,
+        &item.password,
+        "get_series",
+        "series",
+        &mut errors,
+    )
+    .await;
 
-    let priority_playlist = is_priority_playlist(streams_allowed, expiration_date.as_deref(), &live_categories);
+    let priority_playlist = is_priority_playlist(
+        streams_allowed,
+        expiration_date.as_deref(),
+        &live_category_names,
+    );
+    let quality_test = if priority_playlist {
+        Some(
+            quality_test_playlist(
+                client,
+                &base,
+                &item.username,
+                &item.password,
+                &live_categories,
+                live_streams.as_deref().unwrap_or(&[]),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
     PlaylistResult {
         scraped_at_local,
@@ -313,28 +453,241 @@ async fn process_playlist(client: &Client, item: &PlaylistInput) -> PlaylistResu
         live_channels_supported,
         movies_supported,
         series_supported,
-        live_channel_categories: live_categories,
+        live_channel_categories: live_category_names,
+        quality_test,
         errors,
     }
 }
 
-async fn fetch_category_names(client: &Client, base: &str, user: &str, pass: &str, action: &str, stage: &str, errors: &mut Vec<ErrorInfo>) -> Vec<String> {
-    let url = format!("{base}/player_api.php?username={}&password={}&action={}", urlencoding::encode(user), urlencoding::encode(pass), action);
+async fn fetch_live_categories(
+    client: &Client,
+    base: &str,
+    user: &str,
+    pass: &str,
+    errors: &mut Vec<ErrorInfo>,
+) -> Vec<LiveCategory> {
+    let url = format!(
+        "{base}/player_api.php?username={}&password={}&action=get_live_categories",
+        urlencoding::encode(user),
+        urlencoding::encode(pass)
+    );
     match fetch_json_value(client, &url).await {
-        Ok(v) => {
-            if let Some(arr) = v.as_array() {
-                arr.iter().filter_map(|i| i.get("category_name").or_else(|| i.get("name")).or_else(|| i.get("title")).and_then(|x| x.as_str()).map(|s| s.to_string())).collect()
-            } else { Vec::new() }
+        Ok(v) => v
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|i| {
+                        let category_id = i.get("category_id").and_then(value_to_string_ref)?;
+                        let category_name = i
+                            .get("category_name")
+                            .or_else(|| i.get("name"))
+                            .or_else(|| i.get("title"))
+                            .and_then(|x| x.as_str())?
+                            .to_string();
+                        Some(LiveCategory {
+                            category_id,
+                            category_name,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(e) => {
+            errors.push(err(
+                "live_categories",
+                "request_or_parse_error",
+                e.to_string(),
+            ));
+            Vec::new()
         }
-        Err(e) => { errors.push(err(stage, "request_or_parse_error", e.to_string())); Vec::new() }
     }
 }
 
-async fn fetch_count(client: &Client, base: &str, user: &str, pass: &str, action: &str, stage: &str, errors: &mut Vec<ErrorInfo>) -> Option<u64> {
-    let url = format!("{base}/player_api.php?username={}&password={}&action={}", urlencoding::encode(user), urlencoding::encode(pass), action);
+async fn fetch_live_streams(
+    client: &Client,
+    base: &str,
+    user: &str,
+    pass: &str,
+    errors: &mut Vec<ErrorInfo>,
+) -> Option<Vec<LiveStream>> {
+    let url = format!(
+        "{base}/player_api.php?username={}&password={}&action=get_live_streams",
+        urlencoding::encode(user),
+        urlencoding::encode(pass)
+    );
+    match fetch_json_value(client, &url).await {
+        Ok(v) => Some(
+            v.as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|i| {
+                            let stream_id = i.get("stream_id").and_then(value_to_string_ref)?;
+                            let category_id = i.get("category_id").and_then(value_to_string_ref)?;
+                            let name = i
+                                .get("name")
+                                .or_else(|| i.get("title"))
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let container_extension = i
+                                .get("container_extension")
+                                .and_then(|x| x.as_str())
+                                .map(ToString::to_string);
+                            Some(LiveStream {
+                                name,
+                                stream_id,
+                                category_id,
+                                container_extension,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        Err(e) => {
+            errors.push(err("live_streams", "request_or_parse_error", e.to_string()));
+            None
+        }
+    }
+}
+
+async fn quality_test_playlist(
+    client: &Client,
+    base: &str,
+    user: &str,
+    pass: &str,
+    categories: &[LiveCategory],
+    streams: &[LiveStream],
+) -> QualityTest {
+    const SAMPLE_SIZE: usize = 5;
+
+    let priority_ids = priority_category_ids(categories);
+    let category_names = categories
+        .iter()
+        .map(|category| (category.category_id.clone(), category.category_name.clone()))
+        .collect::<HashMap<_, _>>();
+    let candidates = streams
+        .iter()
+        .filter(|stream| priority_ids.contains(&stream.category_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let seed = format!("{base}|{user}|{pass}");
+    let sampled = sample_streams(&candidates, SAMPLE_SIZE, &seed);
+
+    let mut channels = Vec::new();
+    for stream in sampled {
+        let category_name = category_names
+            .get(&stream.category_id)
+            .cloned()
+            .unwrap_or_default();
+        channels.push(probe_stream(client, base, user, pass, stream, category_name).await);
+    }
+
+    let tested = channels.len();
+    let passed = channels.iter().filter(|channel| channel.ok).count();
+    let failed = tested.saturating_sub(passed);
+    let pass_rate = if tested == 0 {
+        0.0
+    } else {
+        passed as f64 / tested as f64
+    };
+
+    QualityTest {
+        enabled: true,
+        sample_size: SAMPLE_SIZE,
+        candidates: candidates.len(),
+        tested,
+        passed,
+        failed,
+        pass_rate,
+        channels,
+    }
+}
+
+async fn probe_stream(
+    client: &Client,
+    base: &str,
+    user: &str,
+    pass: &str,
+    stream: &LiveStream,
+    category_name: String,
+) -> QualityProbeResult {
+    let url = stream_url(base, user, pass, stream);
+    let mut result = QualityProbeResult {
+        name: stream.name.clone(),
+        stream_id: stream.stream_id.clone(),
+        category_name,
+        url: url.clone(),
+        ok: false,
+        status: None,
+        content_type: None,
+        bytes_read: 0,
+        reason: "request_error".to_string(),
+    };
+
+    match client
+        .get(&url)
+        .header(RANGE, "bytes=0-65535")
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            result.status = Some(status.as_u16());
+            result.content_type = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(ToString::to_string);
+
+            if !status.is_success() {
+                result.reason = format!("http_status_{}", status.as_u16());
+                return result;
+            }
+
+            match resp.bytes().await {
+                Ok(bytes) => {
+                    result.bytes_read = bytes.len();
+                    if let Some(reason) = sniff_media(result.content_type.as_deref(), &bytes) {
+                        result.ok = true;
+                        result.reason = reason;
+                    } else if bytes.is_empty() {
+                        result.reason = "empty_body".to_string();
+                    } else {
+                        result.reason = "unknown_content".to_string();
+                    }
+                }
+                Err(e) => result.reason = format!("read_error: {e}"),
+            }
+        }
+        Err(e) => result.reason = format!("request_error: {e}"),
+    }
+
+    result
+}
+
+async fn fetch_count(
+    client: &Client,
+    base: &str,
+    user: &str,
+    pass: &str,
+    action: &str,
+    stage: &str,
+    errors: &mut Vec<ErrorInfo>,
+) -> Option<u64> {
+    let url = format!(
+        "{base}/player_api.php?username={}&password={}&action={}",
+        urlencoding::encode(user),
+        urlencoding::encode(pass),
+        action
+    );
     match fetch_json_value(client, &url).await {
         Ok(v) => v.as_array().map(|a| a.len() as u64),
-        Err(e) => { errors.push(err(stage, "request_or_parse_error", e.to_string())); None }
+        Err(e) => {
+            errors.push(err(stage, "request_or_parse_error", e.to_string()));
+            None
+        }
     }
 }
 
@@ -344,7 +697,19 @@ async fn fetch_json_value(client: &Client, url: &str) -> Result<serde_json::Valu
 }
 
 fn err(stage: &str, code: &str, message: impl Into<String>) -> ErrorInfo {
-    ErrorInfo { stage: stage.to_string(), code: code.to_string(), message: message.into() }
+    ErrorInfo {
+        stage: stage.to_string(),
+        code: code.to_string(),
+        message: message.into(),
+    }
+}
+
+fn value_to_string_ref(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 fn value_to_u64(v: Option<serde_json::Value>) -> Option<u64> {
@@ -357,10 +722,16 @@ fn value_to_u64(v: Option<serde_json::Value>) -> Option<u64> {
 
 fn format_expiration_date(v: &serde_json::Value) -> Option<String> {
     match v {
-        serde_json::Value::Number(n) => n.as_i64().and_then(|secs| Local.timestamp_opt(secs, 0).single()).map(|dt| dt.to_rfc3339()),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .and_then(|secs| Local.timestamp_opt(secs, 0).single())
+            .map(|dt| dt.to_rfc3339()),
         serde_json::Value::String(s) => {
             if let Ok(secs) = s.parse::<i64>() {
-                Local.timestamp_opt(secs, 0).single().map(|dt| dt.to_rfc3339())
+                Local
+                    .timestamp_opt(secs, 0)
+                    .single()
+                    .map(|dt| dt.to_rfc3339())
             } else if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
                 Some(dt.with_timezone(&Local).to_rfc3339())
             } else {
@@ -372,33 +743,60 @@ fn format_expiration_date(v: &serde_json::Value) -> Option<String> {
 }
 
 fn normalize_server(server: &str) -> String {
-    if server.starts_with("http://") || server.starts_with("https://") { server.trim_end_matches('/').to_string() } else { format!("http://{}", server.trim_end_matches('/')) }
+    if server.starts_with("http://") || server.starts_with("https://") {
+        server.trim_end_matches('/').to_string()
+    } else {
+        format!("http://{}", server.trim_end_matches('/'))
+    }
 }
 
 fn absolutize(base: &str, href: &str) -> Result<String> {
     Ok(Url::parse(base)?.join(href)?.to_string())
 }
 
-fn make_file_name(server: &str, user: &str, streams_allowed: Option<u64>, expiration_date: Option<&str>) -> String {
+fn make_file_name(
+    server: &str,
+    user: &str,
+    streams_allowed: Option<u64>,
+    expiration_date: Option<&str>,
+) -> String {
     let local = Local::now().format("%Y%m%d-%H%M%S");
     let streams = streams_allowed.unwrap_or(0);
     let days_left = days_left_token(expiration_date);
-    format!("{local}-{streams}-{days_left}-{}-{}.json", slug(server), slug(user))
+    format!(
+        "{local}-{streams}-{days_left}-{}-{}.json",
+        slug(server),
+        slug(user)
+    )
 }
 
 fn days_left_token(expiration_date: Option<&str>) -> i64 {
-    let Some(expiration_date) = expiration_date else { return 9999; };
-    if expiration_date.trim().is_empty() { return 9999; }
-    let Ok(exp) = DateTime::parse_from_rfc3339(expiration_date) else { return 9999; };
+    let Some(expiration_date) = expiration_date else {
+        return 9999;
+    };
+    if expiration_date.trim().is_empty() {
+        return 9999;
+    }
+    let Ok(exp) = DateTime::parse_from_rfc3339(expiration_date) else {
+        return 9999;
+    };
     let exp = exp.with_timezone(&Local);
     let epoch = Local.timestamp_opt(0, 0).single();
-    if epoch == Some(exp) { return 9999; }
+    if epoch == Some(exp) {
+        return 9999;
+    }
     let now = Local::now();
-    if exp <= now { return 0; }
+    if exp <= now {
+        return 0;
+    }
     (exp - now).num_days()
 }
 
-fn is_priority_playlist(streams_allowed: Option<u64>, expiration_date: Option<&str>, live_categories: &[String]) -> bool {
+fn is_priority_playlist(
+    streams_allowed: Option<u64>,
+    expiration_date: Option<&str>,
+    live_categories: &[String],
+) -> bool {
     matches!(streams_allowed, Some(n) if n >= 2)
         && expiration_is_priority(expiration_date)
         && has_priority_category(live_categories)
@@ -415,14 +813,97 @@ fn expiration_is_priority(expiration_date: Option<&str>) -> bool {
 }
 
 fn has_priority_category(live_categories: &[String]) -> bool {
-    live_categories.iter().any(|c| {
-        let lc = c.to_lowercase();
-        c.contains("US") || c.contains("Usa") || lc.contains("locals")
-    })
+    live_categories.iter().any(|c| is_priority_category_name(c))
+}
+
+fn is_priority_category_name(category_name: &str) -> bool {
+    let lc = category_name.to_lowercase();
+    category_name.contains("US") || category_name.contains("Usa") || lc.contains("locals")
+}
+
+fn priority_category_ids(categories: &[LiveCategory]) -> HashSet<String> {
+    categories
+        .iter()
+        .filter(|c| is_priority_category_name(&c.category_name))
+        .map(|c| c.category_id.clone())
+        .collect()
+}
+
+fn sample_streams<'a>(
+    streams: &'a [LiveStream],
+    sample_size: usize,
+    seed: &str,
+) -> Vec<&'a LiveStream> {
+    let mut keyed = streams
+        .iter()
+        .map(|stream| {
+            let mut hasher = DefaultHasher::new();
+            seed.hash(&mut hasher);
+            stream.stream_id.hash(&mut hasher);
+            stream.name.hash(&mut hasher);
+            stream.category_id.hash(&mut hasher);
+            (hasher.finish(), stream)
+        })
+        .collect::<Vec<_>>();
+
+    keyed.sort_by_key(|(hash, _)| *hash);
+    keyed
+        .into_iter()
+        .take(sample_size)
+        .map(|(_, stream)| stream)
+        .collect()
+}
+
+fn stream_url(base: &str, user: &str, pass: &str, stream: &LiveStream) -> String {
+    let ext = stream
+        .container_extension
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("ts");
+    format!(
+        "{}/live/{}/{}/{}.{}",
+        base.trim_end_matches('/'),
+        urlencoding::encode(user),
+        urlencoding::encode(pass),
+        stream.stream_id,
+        ext
+    )
+}
+
+fn sniff_media(content_type: Option<&str>, body: &[u8]) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+
+    let content_type = content_type.unwrap_or("").to_lowercase();
+    let start = body.get(..body.len().min(64)).unwrap_or(body);
+
+    if content_type.contains("mpegurl") || start.starts_with(b"#EXTM3U") {
+        return Some("hls".to_string());
+    }
+
+    if content_type.contains("video/mp2t")
+        || (body.len() > 188 && body[0] == 0x47 && body.get(188) == Some(&0x47))
+    {
+        return Some("mpeg_ts".to_string());
+    }
+
+    if content_type.contains("video/mp4") || start.windows(4).any(|w| w == b"ftyp") {
+        return Some("mp4".to_string());
+    }
+
+    if content_type.contains("application/octet-stream") && body.len() >= 188 {
+        return Some("probable_octet_stream".to_string());
+    }
+
+    None
 }
 
 async fn notify_ntfy(client: &Client, topic_url: &str, processed: usize, priority_written: usize) {
-    let body = format!("iptvscraper done: processed {processed} playlists; wrote {priority_written} priority playlists");
+    let body = format!(
+        "iptvscraper done: processed {processed} playlists; wrote {priority_written} priority playlists"
+    );
     let result = client
         .post(topic_url)
         .header("Title", "iptvscraper priority alert")
@@ -437,9 +918,12 @@ async fn notify_ntfy(client: &Client, topic_url: &str, processed: usize, priorit
 }
 
 fn slug(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>().trim_matches('-').to_string()
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -448,13 +932,22 @@ mod tests {
     #[test]
     fn parses_entry_date_from_title_as_end_of_day() {
         let dt = parse_entry_date("IPTV { 28/MAI/2026 } ✪~✪ Table").unwrap();
-        assert_eq!(dt.format("%Y-%m-%dT%H:%M:%S").to_string(), "2026-05-28T23:59:59");
+        assert_eq!(
+            dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "2026-05-28T23:59:59"
+        );
     }
 
     #[test]
     fn parses_entry_date_from_url_slug() {
-        let dt = parse_entry_date_from_url("https://www.iptvregion.eu.org/2026/05/iptv-28mai2026-table-of-28-account.html").unwrap();
-        assert_eq!(dt.format("%Y-%m-%dT%H:%M:%S").to_string(), "2026-05-28T23:59:59");
+        let dt = parse_entry_date_from_url(
+            "https://www.iptvregion.eu.org/2026/05/iptv-28mai2026-table-of-28-account.html",
+        )
+        .unwrap();
+        assert_eq!(
+            dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "2026-05-28T23:59:59"
+        );
     }
 
     #[test]
@@ -470,5 +963,103 @@ mod tests {
         assert!(is_priority_playlist(Some(2), None, &usa));
         assert!(is_priority_playlist(Some(2), None, &locals));
         assert!(!is_priority_playlist(Some(2), None, &no_match));
+    }
+
+    #[test]
+    fn priority_category_ids_match_existing_category_rules() {
+        let categories = vec![
+            LiveCategory {
+                category_id: "1".to_string(),
+                category_name: "US Entertainment".to_string(),
+            },
+            LiveCategory {
+                category_id: "2".to_string(),
+                category_name: "Canada".to_string(),
+            },
+            LiveCategory {
+                category_id: "3".to_string(),
+                category_name: "LOCALs".to_string(),
+            },
+        ];
+
+        let ids = priority_category_ids(&categories);
+
+        assert!(ids.contains("1"));
+        assert!(ids.contains("3"));
+        assert!(!ids.contains("2"));
+    }
+
+    #[test]
+    fn deterministic_sampler_returns_stable_max_five_streams() {
+        let streams = (1..=8)
+            .map(|id| LiveStream {
+                name: format!("Channel {id}"),
+                stream_id: id.to_string(),
+                category_id: "1".to_string(),
+                container_extension: Some("ts".to_string()),
+            })
+            .collect::<Vec<_>>();
+
+        let first = sample_streams(&streams, 5, "playlist-a");
+        let second = sample_streams(&streams, 5, "playlist-a");
+
+        assert_eq!(first.len(), 5);
+        assert_eq!(
+            first.iter().map(|s| &s.stream_id).collect::<Vec<_>>(),
+            second.iter().map(|s| &s.stream_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stream_url_uses_extension_and_ts_fallback() {
+        let with_ext = LiveStream {
+            name: "One".to_string(),
+            stream_id: "123".to_string(),
+            category_id: "1".to_string(),
+            container_extension: Some("m3u8".to_string()),
+        };
+        let no_ext = LiveStream {
+            name: "Two".to_string(),
+            stream_id: "456".to_string(),
+            category_id: "1".to_string(),
+            container_extension: None,
+        };
+
+        assert_eq!(
+            stream_url("http://example.com", "user", "pass", &with_ext),
+            "http://example.com/live/user/pass/123.m3u8"
+        );
+        assert_eq!(
+            stream_url("http://example.com/", "user", "pass", &no_ext),
+            "http://example.com/live/user/pass/456.ts"
+        );
+    }
+
+    #[test]
+    fn sniff_media_accepts_hls_ts_mp4_and_octet_stream() {
+        let mut ts_packet = vec![0_u8; 189];
+        ts_packet[0] = 0x47;
+        ts_packet[188] = 0x47;
+
+        assert_eq!(
+            sniff_media(Some("application/vnd.apple.mpegurl"), b"#EXTM3U\n#EXTINF"),
+            Some("hls".to_string())
+        );
+        assert_eq!(sniff_media(None, &ts_packet), Some("mpeg_ts".to_string()));
+        assert_eq!(
+            sniff_media(None, b"\0\0\0\x18ftypmp42"),
+            Some("mp4".to_string())
+        );
+        assert_eq!(
+            sniff_media(Some("application/octet-stream"), &[1_u8; 256]),
+            Some("probable_octet_stream".to_string())
+        );
+    }
+
+    #[test]
+    fn sniff_media_rejects_empty_short_ts_and_html() {
+        assert_eq!(sniff_media(None, b""), None);
+        assert_eq!(sniff_media(None, &[0x47, 0, 0, 0, 0]), None);
+        assert_eq!(sniff_media(Some("text/html"), b"<html>nope</html>"), None);
     }
 }
