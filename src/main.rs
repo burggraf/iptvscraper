@@ -4,7 +4,7 @@ use clap::Parser;
 use regex::Regex;
 use reqwest::{
     Client,
-    header::{CONTENT_TYPE, RANGE},
+    header::{ACCEPT_ENCODING, CONTENT_TYPE, RANGE},
 };
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -628,6 +628,7 @@ async fn probe_stream(
     match client
         .get(&url)
         .header(RANGE, "bytes=0-65535")
+        .header(ACCEPT_ENCODING, "identity")
         .timeout(Duration::from_secs(8))
         .send()
         .await
@@ -646,7 +647,7 @@ async fn probe_stream(
                 return result;
             }
 
-            match resp.bytes().await {
+            match read_probe_bytes(resp, result.content_type.as_deref()).await {
                 Ok(bytes) => {
                     result.bytes_read = bytes.len();
                     if let Some(reason) = sniff_media(result.content_type.as_deref(), &bytes) {
@@ -665,6 +666,28 @@ async fn probe_stream(
     }
 
     result
+}
+
+async fn read_probe_bytes(
+    mut resp: reqwest::Response,
+    content_type: Option<&str>,
+) -> Result<Vec<u8>, reqwest::Error> {
+    const MAX_PROBE_BYTES: usize = 64 * 1024;
+
+    let mut body = Vec::new();
+    while body.len() < MAX_PROBE_BYTES {
+        let Some(chunk) = resp.chunk().await? else {
+            break;
+        };
+        let remaining = MAX_PROBE_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+
+        if sniff_media(content_type, &body).is_some() {
+            break;
+        }
+    }
+
+    Ok(body)
 }
 
 async fn fetch_count(
@@ -797,7 +820,8 @@ fn is_priority_playlist(
     expiration_date: Option<&str>,
     live_categories: &[String],
 ) -> bool {
-    let streams_ok = matches!(streams_allowed, Some(0)) || matches!(streams_allowed, Some(n) if n >= 2);
+    let streams_ok =
+        matches!(streams_allowed, Some(0)) || matches!(streams_allowed, Some(n) if n >= 2);
     streams_ok && expiration_is_priority(expiration_date) && has_priority_category(live_categories)
 }
 
@@ -1060,6 +1084,60 @@ mod tests {
             sniff_media(Some("application/octet-stream"), &[1_u8; 256]),
             Some("probable_octet_stream".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn probe_stream_accepts_live_stream_that_stays_open() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request);
+
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\r\n")
+                .unwrap();
+            let mut ts = vec![0_u8; 376];
+            ts[0] = 0x47;
+            ts[188] = 0x47;
+            socket.write_all(&ts).unwrap();
+            socket.flush().unwrap();
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .user_agent("iptvscraper-test")
+            .build()
+            .unwrap();
+        let stream = LiveStream {
+            name: "Live".to_string(),
+            stream_id: "1".to_string(),
+            category_id: "1".to_string(),
+            container_extension: Some("ts".to_string()),
+        };
+
+        let result = probe_stream(
+            &client,
+            &format!("http://{addr}"),
+            "user",
+            "pass",
+            &stream,
+            "Test".to_string(),
+        )
+        .await;
+
+        assert!(result.ok, "{result:?}");
+        assert_eq!(result.reason, "mpeg_ts");
+        assert!(result.bytes_read > 0, "{result:?}");
     }
 
     #[test]
