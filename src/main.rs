@@ -797,9 +797,8 @@ fn is_priority_playlist(
     expiration_date: Option<&str>,
     live_categories: &[String],
 ) -> bool {
-    matches!(streams_allowed, Some(n) if n >= 2)
-        && expiration_is_priority(expiration_date)
-        && has_priority_category(live_categories)
+    let streams_ok = matches!(streams_allowed, Some(0)) || matches!(streams_allowed, Some(n) if n >= 2);
+    streams_ok && expiration_is_priority(expiration_date) && has_priority_category(live_categories)
 }
 
 fn expiration_is_priority(expiration_date: Option<&str>) -> bool {
@@ -951,14 +950,21 @@ mod tests {
     }
 
     #[test]
-    fn priority_playlist_needs_streams_expiration_and_us_or_locals_category() {
+    fn priority_playlist_allows_zero_or_at_least_two_streams() {
+        let us = vec!["US Entertainment".to_string()];
+
+        assert!(is_priority_playlist(Some(0), None, &us));
+        assert!(!is_priority_playlist(Some(1), None, &us));
+        assert!(is_priority_playlist(Some(2), None, &us));
+    }
+
+    #[test]
+    fn priority_playlist_keeps_other_rules_intact() {
         let us = vec!["US Entertainment".to_string()];
         let usa = vec!["Usa Sports".to_string()];
         let locals = vec!["LOCALs".to_string()];
         let no_match = vec!["Canada".to_string()];
 
-        assert!(!is_priority_playlist(Some(1), None, &us));
-        assert!(is_priority_playlist(Some(2), None, &us));
         assert!(is_priority_playlist(Some(2), Some(""), &us));
         assert!(is_priority_playlist(Some(2), None, &usa));
         assert!(is_priority_playlist(Some(2), None, &locals));
