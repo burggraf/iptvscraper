@@ -164,14 +164,24 @@ async fn main() -> Result<()> {
     let mut queue: VecDeque<PlaylistInput> = queue_inputs.into();
     let total = queue.len();
     let mut processed = 0usize;
+    let mut skipped = 0usize;
+    let mut written = 0usize;
     let mut priority_written = 0usize;
     fs::create_dir_all("playlists").ok();
     fs::create_dir_all("priority-playlists").ok();
+    let seen_inputs = load_seen_inputs(&["playlists", "priority-playlists"]);
 
     while let Some(item) = queue.pop_front() {
-        processed += 1;
         let remaining = queue.len();
-        println!("processed {processed}/{total}, remaining {remaining}");
+        if seen_inputs.contains(&input_key(&item)) {
+            skipped += 1;
+            println!(
+                "skipped {skipped}/{total}, processed {processed}, remaining {remaining}: already exists"
+            );
+            continue;
+        }
+        processed += 1;
+        println!("processed {processed}/{total}, skipped {skipped}, remaining {remaining}");
         let result = process_playlist(&client, &item).await;
         let is_priority = result.priority_playlist;
         let folder = if is_priority {
@@ -179,8 +189,20 @@ async fn main() -> Result<()> {
         } else {
             "playlists"
         };
-        if is_priority {
-            priority_written += 1;
+        let suffix = playlist_file_suffix(
+            &item.server,
+            &item.username,
+            result.streams_allowed,
+            result.expiration_date.as_deref(),
+        );
+        if playlist_file_exists(&suffix, "playlists")
+            || playlist_file_exists(&suffix, "priority-playlists")
+        {
+            skipped += 1;
+            println!(
+                "skipped {skipped}/{total}, processed {processed}, remaining {remaining}: output file exists"
+            );
+            continue;
         }
         let file_name = make_file_name(
             &item.server,
@@ -190,11 +212,15 @@ async fn main() -> Result<()> {
         );
         let path = Path::new(folder).join(file_name);
         fs::write(&path, serde_json::to_string_pretty(&result)?)?;
+        written += 1;
+        if is_priority {
+            priority_written += 1;
+        }
     }
 
     if total > 0 {
         println!(
-            "summary: processed {processed} playlists; wrote {priority_written} priority playlists"
+            "summary: processed {processed} playlists; skipped {skipped}; wrote {written} playlists ({priority_written} priority)"
         );
         if priority_written > 0 {
             notify_ntfy(&client, &args.ntfy_topic, processed, priority_written).await;
@@ -233,6 +259,43 @@ fn write_last_run(ts: DateTime<Local>) -> Result<()> {
         serde_json::to_string_pretty(&serde_json::json!({"last_run_local": ts.to_rfc3339()}))?,
     )?;
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct SeenPlaylist {
+    source_entry_url: String,
+    server: String,
+    username: String,
+    password: String,
+}
+
+fn input_key(item: &PlaylistInput) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}",
+        item.source_entry_url, item.server, item.username, item.password
+    )
+}
+
+fn load_seen_inputs(folders: &[&str]) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    for folder in folders {
+        let Ok(entries) = fs::read_dir(folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(text) = fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<SeenPlaylist>(&text) else {
+                continue;
+            };
+            seen.insert(format!(
+                "{}\u{0}{}\u{0}{}\u{0}{}",
+                parsed.source_entry_url, parsed.server, parsed.username, parsed.password
+            ));
+        }
+    }
+    seen
 }
 
 async fn scrape_label_entries(client: &Client, url: &str) -> Result<Vec<Entry>> {
@@ -783,14 +846,35 @@ fn make_file_name(
     streams_allowed: Option<u64>,
     expiration_date: Option<&str>,
 ) -> String {
-    let local = Local::now().format("%Y%m%d-%H%M%S");
+    format!(
+        "{}{}",
+        Local::now().format("%Y%m%d-%H%M%S"),
+        playlist_file_suffix(server, user, streams_allowed, expiration_date)
+    )
+}
+
+fn playlist_file_suffix(
+    server: &str,
+    user: &str,
+    streams_allowed: Option<u64>,
+    expiration_date: Option<&str>,
+) -> String {
     let streams = streams_allowed.unwrap_or(0);
     let days_left = days_left_token(expiration_date);
     format!(
-        "{local}-{streams}-{days_left}-{}-{}.json",
+        "-{streams}-{days_left}-{}-{}.json",
         slug(server),
         slug(user)
     )
+}
+
+fn playlist_file_exists(suffix: &str, folder: &str) -> bool {
+    fs::read_dir(folder)
+        .ok()
+        .into_iter()
+        .flat_map(|it| it.flatten())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .any(|name| name.ends_with(suffix))
 }
 
 fn days_left_token(expiration_date: Option<&str>) -> i64 {
@@ -971,6 +1055,58 @@ mod tests {
             dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
             "2026-05-28T23:59:59"
         );
+    }
+
+    #[test]
+    fn playlist_file_suffix_ignores_timestamp_prefix() {
+        let suffix = playlist_file_suffix(
+            "http://example.com",
+            "user1",
+            Some(10),
+            Some("2026-06-03T23:59:59+00:00"),
+        );
+
+        assert_eq!(suffix, "-10-0-http---example-com-user1.json");
+        assert!("20260603-020405-10-0-http---example-com-user1.json".ends_with(&suffix));
+    }
+
+    #[test]
+    fn load_seen_inputs_matches_exact_playlist_row_identity() {
+        let dir = std::env::temp_dir().join(format!(
+            "iptvscraper-test-{}",
+            Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        let folder = dir.join("playlists");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("one.json"),
+            serde_json::json!({
+                "source_entry_url": "https://site/a.html",
+                "server": "http://example.com",
+                "username": "user1",
+                "password": "pass1"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(folder.join("bad.json"), "not json").unwrap();
+
+        let seen = load_seen_inputs(&[folder.to_str().unwrap()]);
+        let item = PlaylistInput {
+            source_entry_title: "x".to_string(),
+            source_entry_url: "https://site/a.html".to_string(),
+            server: "http://example.com".to_string(),
+            username: "user1".to_string(),
+            password: "pass1".to_string(),
+        };
+        let other = PlaylistInput {
+            password: "pass2".to_string(),
+            ..item.clone()
+        };
+
+        assert!(seen.contains(&input_key(&item)));
+        assert!(!seen.contains(&input_key(&other)));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
