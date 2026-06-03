@@ -12,6 +12,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     fs,
     hash::{Hash, Hasher},
+    io::Write,
     path::Path,
     time::Duration,
 };
@@ -214,6 +215,7 @@ async fn main() -> Result<()> {
         fs::write(&path, serde_json::to_string_pretty(&result)?)?;
         written += 1;
         if is_priority {
+            append_priority_playlist(&result)?;
             priority_written += 1;
         }
     }
@@ -259,6 +261,70 @@ fn write_last_run(ts: DateTime<Local>) -> Result<()> {
         serde_json::to_string_pretty(&serde_json::json!({"last_run_local": ts.to_rfc3339()}))?,
     )?;
     Ok(())
+}
+
+fn append_priority_playlist(result: &PlaylistResult) -> Result<()> {
+    let path = Path::new("./prority-playlists.txt");
+    let rows = load_priority_playlist_rows(path)?;
+    let key = priority_playlist_key(&result.server, &result.username, &result.password);
+    if rows.contains(&key) {
+        return Ok(());
+    }
+
+    let needs_header = !path.exists() || fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    if needs_header {
+        writeln!(file, "server\tusername\tpassword\tstreams_allowed\texpiration_date\tlive_channels_supported\tmovies_supported\tseries_supported\tkey_categories")?;
+    }
+    writeln!(
+        file,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        tsv(&result.server),
+        tsv(&result.username),
+        tsv(&result.password),
+        result.streams_allowed.map(|v| v.to_string()).unwrap_or_default(),
+        result.expiration_date.as_deref().map(tsv).unwrap_or_default(),
+        result
+            .live_channels_supported
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        result.movies_supported.map(|v| v.to_string()).unwrap_or_default(),
+        result.series_supported.map(|v| v.to_string()).unwrap_or_default(),
+        tsv(&key_categories(&result.live_channel_categories)),
+    )?;
+    Ok(())
+}
+
+fn load_priority_playlist_rows(path: &Path) -> Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(out);
+    };
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        out.insert(priority_playlist_key(cols[0], cols[1], cols[2]));
+    }
+    Ok(out)
+}
+
+fn priority_playlist_key(server: &str, username: &str, password: &str) -> String {
+    format!("{}\u{0}{}\u{0}{}", server, username, password)
+}
+
+fn key_categories(live_categories: &[String]) -> String {
+    live_categories
+        .iter()
+        .filter(|c| is_priority_category_name(c))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn tsv(s: &str) -> String {
+    s.replace(['\t', '\r', '\n'], " ")
 }
 
 #[derive(Debug, Deserialize)]
