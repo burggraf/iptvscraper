@@ -10,6 +10,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
+    env,
     fs,
     hash::{Hash, Hasher},
     io::Write,
@@ -21,6 +22,10 @@ use url::Url;
 const LABEL_URL: &str = "https://www.iptvregion.eu.org/search/label/XTREAM";
 const STATE_FILE: &str = ".iptvscraper-last-run.json";
 const DEFAULT_NTFY_TOPIC_URL: &str = "https://ntfy.sh/mb-iptvscraper";
+const PRIORITY_PLAYLIST_TSV: &str = "./priority-playlists.txt";
+const GOOGLE_SERVICE_ACCOUNT_FILE_ENV: &str = "GOOGLE_SERVICE_ACCOUNT_FILE";
+const GOOGLE_SHEET_ID_ENV: &str = "GOOGLE_SHEET_ID";
+const GOOGLE_SHEET_TAB_ENV: &str = "GOOGLE_SHEET_TAB";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -168,6 +173,11 @@ async fn main() -> Result<()> {
     let mut skipped = 0usize;
     let mut written = 0usize;
     let mut priority_written = 0usize;
+    let google_sync = GoogleSheetsSync::from_env()?;
+    migrate_priority_playlist_tsv(Path::new(PRIORITY_PLAYLIST_TSV))?;
+    if let Some(sync) = &google_sync {
+        sync.ensure_sheet_schema(&client).await?;
+    }
     fs::create_dir_all("playlists").ok();
     fs::create_dir_all("priority-playlists").ok();
     let seen_inputs = load_seen_inputs(&["playlists", "priority-playlists"]);
@@ -216,6 +226,9 @@ async fn main() -> Result<()> {
         written += 1;
         if is_priority {
             append_priority_playlist(&result)?;
+            if let Some(sync) = &google_sync {
+                sync.append_priority_playlist(&client, &result).await?;
+            }
             priority_written += 1;
         }
     }
@@ -263,8 +276,262 @@ fn write_last_run(ts: DateTime<Local>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct GoogleServiceAccountFile {
+    client_email: String,
+    private_key: String,
+    #[serde(default = "default_google_token_uri")]
+    token_uri: String,
+}
+
+#[derive(Debug)]
+struct GoogleSheetsSync {
+    sheet_id: String,
+    tab: String,
+    service_account: GoogleServiceAccountFile,
+}
+
+impl GoogleSheetsSync {
+    fn from_env() -> Result<Option<Self>> {
+        let sheet_id = match env::var(GOOGLE_SHEET_ID_ENV) {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                println!(
+                    "google sheets sync disabled; set {GOOGLE_SERVICE_ACCOUNT_FILE_ENV} and {GOOGLE_SHEET_ID_ENV} to enable; local TSV still writes"
+                );
+                return Ok(None);
+            }
+        };
+        let service_account_file = match env::var(GOOGLE_SERVICE_ACCOUNT_FILE_ENV) {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                println!(
+                    "google sheets sync disabled; missing {GOOGLE_SERVICE_ACCOUNT_FILE_ENV}; local TSV still writes"
+                );
+                return Ok(None);
+            }
+        };
+        let tab = env::var(GOOGLE_SHEET_TAB_ENV).unwrap_or_else(|_| "priority-playlists".to_string());
+        let text = match fs::read_to_string(&service_account_file) {
+            Ok(text) => text,
+            Err(_) => {
+                println!(
+                    "google sheets sync disabled; service account file not found: {service_account_file}; local TSV still writes"
+                );
+                return Ok(None);
+            }
+        };
+        let service_account: GoogleServiceAccountFile = serde_json::from_str(&text)
+            .with_context(|| format!("parse google service account json: {service_account_file}"))?;
+        Ok(Some(Self { sheet_id, tab, service_account }))
+    }
+
+    async fn ensure_sheet_schema(&self, client: &Client) -> Result<()> {
+        let token = self.access_token(client).await?;
+        let existing = self.sheet_rows(client, &token).await?;
+        if existing.is_empty() {
+            self.write_sheet_header(client, &token).await?;
+        } else if existing
+            .first()
+            .and_then(|row| row.first())
+            .map(|cell| cell.as_str())
+            != Some("added_at_local")
+        {
+            self.migrate_sheet_rows(client, &token, existing).await?;
+        }
+        Ok(())
+    }
+
+    async fn append_priority_playlist(&self, client: &Client, result: &PlaylistResult) -> Result<()> {
+        let row = priority_playlist_sheet_row(result);
+        let key = priority_playlist_key(&result.server, &result.username, &result.password);
+        let token = self.access_token(client).await?;
+        let mut existing = self.sheet_rows(client, &token).await?;
+        if existing.is_empty() {
+            self.write_sheet_header(client, &token).await?;
+        } else if existing
+            .first()
+            .and_then(|row| row.first())
+            .map(|cell| cell.as_str())
+            != Some("added_at_local")
+        {
+            existing = self.migrate_sheet_rows(client, &token, existing).await?;
+        }
+        if existing
+            .iter()
+            .skip(1)
+            .any(|cols| {
+                (cols.len() >= 10 && priority_playlist_key(&cols[1], &cols[2], &cols[3]) == key)
+                    || (cols.len() >= 3
+                        && priority_playlist_key(&cols[0], &cols[1], &cols[2]) == key)
+            })
+        {
+            return Ok(());
+        }
+        let url = format!(
+            "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
+            self.sheet_id,
+            urlencoding::encode(&google_sheet_range(&self.tab, "A:J"))
+        );
+        let resp = client
+            .post(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({"values": [row]}))
+            .send()
+            .await
+            .with_context(|| "append row to google sheet")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("google sheets append failed: {}", resp.status());
+        }
+        Ok(())
+    }
+
+    async fn sheet_rows(
+        &self,
+        client: &Client,
+        token: &str,
+    ) -> Result<Vec<Vec<String>>> {
+        let url = format!(
+            "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}",
+            self.sheet_id,
+            urlencoding::encode(&google_sheet_range(&self.tab, "A:J"))
+        );
+        let resp = client
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("read google sheet rows")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("google sheets read failed: {}", resp.status());
+        }
+        let v: serde_json::Value = resp.json().await.context("parse google sheet rows")?;
+        Ok(v.get("values")
+            .and_then(|v| v.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_array())
+                    .map(|row| {
+                        row.iter()
+                            .map(|cell| cell.as_str().unwrap_or_default().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn migrate_sheet_rows(
+        &self,
+        client: &Client,
+        token: &str,
+        existing: Vec<Vec<String>>,
+    ) -> Result<Vec<Vec<String>>> {
+        let mut migrated = Vec::new();
+        migrated.push(
+            priority_playlist_headers()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        );
+        for row in existing.into_iter().skip(1) {
+            let mut new_row = vec![String::new()];
+            new_row.extend(row);
+            migrated.push(new_row);
+        }
+        let url = format!(
+            "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}?valueInputOption=RAW",
+            self.sheet_id,
+            urlencoding::encode(&google_sheet_range(&self.tab, "A:J"))
+        );
+        let resp = client
+            .put(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({"values": migrated}))
+            .send()
+            .await
+            .context("migrate google sheet rows")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("google sheets migration failed: {}", resp.status());
+        }
+        self.sheet_rows(client, token).await
+    }
+
+    async fn write_sheet_header(
+        &self,
+        client: &Client,
+        token: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}?valueInputOption=RAW",
+            self.sheet_id,
+            urlencoding::encode(&google_sheet_range(&self.tab, "A1:J1"))
+        );
+        let resp = client
+            .put(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({"values": [priority_playlist_headers()]}))
+            .send()
+            .await
+            .context("write google sheet header")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("google sheets header write failed: {}", resp.status());
+        }
+        Ok(())
+    }
+
+    async fn access_token(&self, client: &Client) -> Result<String> {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        #[derive(Serialize)]
+        struct Claims<'a> {
+            iss: &'a str,
+            scope: &'a str,
+            aud: &'a str,
+            exp: usize,
+            iat: usize,
+        }
+        let now = chrono::Utc::now().timestamp() as usize;
+        let claims = Claims {
+            iss: &self.service_account.client_email,
+            scope: "https://www.googleapis.com/auth/spreadsheets",
+            aud: &self.service_account.token_uri,
+            iat: now,
+            exp: now + 3600,
+        };
+        let key = EncodingKey::from_rsa_pem(self.service_account.private_key.as_bytes())
+            .context("load google service account private key")?;
+        let jwt = encode(&Header::new(Algorithm::RS256), &claims, &key)
+            .context("sign google jwt")?;
+        let body = format!(
+            "grant_type={}&assertion={}",
+            urlencoding::encode("urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            urlencoding::encode(&jwt)
+        );
+        let resp = client
+            .post(&self.service_account.token_uri)
+            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await
+            .context("request google access token")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("google token request failed: {}", resp.status());
+        }
+        let v: serde_json::Value = resp.json().await.context("parse google token response")?;
+        v.get("access_token")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .context("missing google access_token")
+    }
+}
+
+fn default_google_token_uri() -> String {
+    "https://oauth2.googleapis.com/token".to_string()
+}
+
 fn append_priority_playlist(result: &PlaylistResult) -> Result<()> {
-    let path = Path::new("./prority-playlists.txt");
+    let path = Path::new(PRIORITY_PLAYLIST_TSV);
+    migrate_priority_playlist_tsv(path)?;
     let rows = load_priority_playlist_rows(path)?;
     let key = priority_playlist_key(&result.server, &result.username, &result.password);
     if rows.contains(&key) {
@@ -274,11 +541,31 @@ fn append_priority_playlist(result: &PlaylistResult) -> Result<()> {
     let needs_header = !path.exists() || fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
     let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
     if needs_header {
-        writeln!(file, "server\tusername\tpassword\tstreams_allowed\texpiration_date\tlive_channels_supported\tmovies_supported\tseries_supported\tkey_categories")?;
+        writeln!(file, "{}", priority_playlist_headers().join("\t"))?;
     }
-    writeln!(
-        file,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+    writeln!(file, "{}", priority_playlist_tsv_row(result).join("\t"))?;
+    Ok(())
+}
+
+fn priority_playlist_headers() -> Vec<&'static str> {
+    vec![
+        "added_at_local",
+        "server",
+        "username",
+        "password",
+        "streams_allowed",
+        "expiration_date",
+        "live_channels_supported",
+        "movies_supported",
+        "series_supported",
+        "key_categories",
+    ]
+}
+
+fn priority_playlist_tsv_row(result: &PlaylistResult) -> Vec<String> {
+    let added_at_local = Local::now().to_rfc3339();
+    vec![
+        added_at_local,
         tsv(&result.server),
         tsv(&result.username),
         tsv(&result.password),
@@ -291,7 +578,33 @@ fn append_priority_playlist(result: &PlaylistResult) -> Result<()> {
         result.movies_supported.map(|v| v.to_string()).unwrap_or_default(),
         result.series_supported.map(|v| v.to_string()).unwrap_or_default(),
         tsv(&key_categories(&result.live_channel_categories)),
-    )?;
+    ]
+}
+
+fn priority_playlist_sheet_row(result: &PlaylistResult) -> Vec<String> {
+    priority_playlist_tsv_row(result)
+}
+
+fn migrate_priority_playlist_tsv(path: &Path) -> Result<()> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Ok(());
+    };
+    if header.split('\t').next() == Some("added_at_local") {
+        return Ok(());
+    }
+    let mut migrated = String::new();
+    migrated.push_str(&priority_playlist_headers().join("\t"));
+    migrated.push('\n');
+    for line in lines {
+        migrated.push('\t');
+        migrated.push_str(line);
+        migrated.push('\n');
+    }
+    fs::write(path, migrated)?;
     Ok(())
 }
 
@@ -302,10 +615,11 @@ fn load_priority_playlist_rows(path: &Path) -> Result<HashSet<String>> {
     };
     for line in text.lines().skip(1) {
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 3 {
-            continue;
+        if cols.len() >= 10 {
+            out.insert(priority_playlist_key(cols[1], cols[2], cols[3]));
+        } else if cols.len() >= 3 {
+            out.insert(priority_playlist_key(cols[0], cols[1], cols[2]));
         }
-        out.insert(priority_playlist_key(cols[0], cols[1], cols[2]));
     }
     Ok(out)
 }
@@ -325,6 +639,14 @@ fn key_categories(live_categories: &[String]) -> String {
 
 fn tsv(s: &str) -> String {
     s.replace(['\t', '\r', '\n'], " ")
+}
+
+fn google_sheet_range(tab: &str, cells: &str) -> String {
+    if tab.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        format!("{tab}!{cells}")
+    } else {
+        format!("'{}'!{cells}", tab.replace('\'', "''"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1101,6 +1423,47 @@ fn slug(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn priority_playlist_export_path_is_spelled_correctly() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .unwrap();
+
+        let misspelled = ["./pro", "rity-playlists.txt"].concat();
+
+        assert!(source.contains("./priority-playlists.txt"));
+        assert!(!source.contains(&misspelled));
+    }
+
+    #[test]
+    fn priority_playlist_tsv_row_has_expected_key_categories() {
+        let result = PlaylistResult {
+            scraped_at_local: "now".to_string(),
+            source_entry_title: "title".to_string(),
+            source_entry_url: "url".to_string(),
+            server: "server".to_string(),
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            priority_playlist: true,
+            streams_allowed: Some(2),
+            streams_in_use: None,
+            expiration_date: Some("2026-01-01T00:00:00+00:00".to_string()),
+            live_channels_supported: Some(10),
+            movies_supported: Some(3),
+            series_supported: Some(4),
+            live_channel_categories: vec!["US Sports".to_string(), "Canada".to_string(), "localS".to_string()],
+            quality_test: None,
+            errors: vec![],
+        };
+
+        assert_eq!(priority_playlist_headers()[0], "added_at_local");
+
+        let row = priority_playlist_tsv_row(&result);
+        assert_eq!(row.len(), 10);
+        assert_eq!(row[9], "US Sports,localS");
+    }
 
     #[test]
     fn parses_entry_date_from_title_as_end_of_day() {
